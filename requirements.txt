@@ -1,7 +1,8 @@
-pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
-fastapi
-uvicorn
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+fastapi==0.110.0
+uvicorn==0.29.0
 torch==2.3.1+cpu
 torchaudio==2.3.1+cpu
-transformers
-aiohttp
+transformers==4.41.2
+aiohttp==3.9.5
