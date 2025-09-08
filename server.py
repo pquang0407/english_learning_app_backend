@@ -51,7 +51,8 @@ device = torch.device("cpu")
 print(f"✅ Using device: {device}")
 
 # Sử dụng chính xác đường dẫn bạn cung cấp
-model_path = "https://drive.google.com/file/d/1B8W6XI0-9NLJntuMN9tX0Jl0uH4ROjPU/view?usp=drive_link"
+model_path = "https://www.dropbox.com/scl/fi/asxj6i1lt4k9ydjnnwshy/asr_model_epoch3.pt?rlkey=tbn0jur4g9eiac991n6vvxryt&st=3nz0mhse&dl=1
+"
 
 asr_processor = WhisperProcessor.from_pretrained("openai/whisper-tiny", task="transcribe", language="en")
 asr_model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny")
@@ -244,4 +245,5 @@ async def get_topics():
 # ------------------
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
