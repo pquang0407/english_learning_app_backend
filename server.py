@@ -50,21 +50,30 @@ app.add_middleware(
 device = torch.device("cpu")
 print(f"✅ Using device: {device}")
 
-# Sử dụng chính xác đường dẫn bạn cung cấp
-model_path = "https://www.dropbox.com/scl/fi/asxj6i1lt4k9ydjnnwshy/asr_model_epoch3.pt?rlkey=tbn0jur4g9eiac991n6vvxryt&st=3nz0mhse&dl=1
-"
+# Link Dropbox direct download
+url = "https://www.dropbox.com/scl/fi/asxj6i1lt4k9ydjnnwshy/asr_model_epoch3.pt?rlkey=tbn0jur4g9eiac991n6vvxryt&st=3nz0mhse&dl=1"
+model_path = "asr_model_epoch3.pt"
 
+# Tải model nếu chưa có trong container
+if not os.path.exists(model_path):
+    print("⬇️ Downloading model from Dropbox...")
+    r = requests.get(url, allow_redirects=True)
+    with open(model_path, "wb") as f:
+        f.write(r.content)
+
+print("✅ Model ready:", model_path)
+
+# Load Whisper processor & model base
 asr_processor = WhisperProcessor.from_pretrained("openai/whisper-tiny", task="transcribe", language="en")
 asr_model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny")
 
-if os.path.exists(model_path):
-    try:
-        asr_model.load_state_dict(torch.load(model_path, map_location=device))
-        print(f"✅ Successfully loaded custom ASR checkpoint from: {model_path}")
-    except Exception as e:
-        print(f"❌ Error loading checkpoint: {e}. Using base Whisper model instead.")
-else:
-    print(f"❌ ASR checkpoint file not found at: {model_path}. Using base Whisper model.")
+# Load state_dict từ checkpoint nếu có
+try:
+    state_dict = torch.load(model_path, map_location=device)
+    asr_model.load_state_dict(state_dict)
+    print(f"✅ Successfully loaded custom ASR checkpoint from: {model_path}")
+except Exception as e:
+    print(f"❌ Error loading checkpoint: {e}. Using base Whisper model instead.")
 
 asr_model.to(device)
 asr_model.eval()
@@ -247,3 +256,4 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
