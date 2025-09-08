@@ -15,6 +15,7 @@ import json
 import asyncio
 import re
 import random
+import requests
 
 # Giả định bạn có file scoring.py tại app/backend/utils/scoring.py
 # Nếu không, bạn có thể comment dòng này và hàm score_transcription
@@ -250,5 +251,6 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
