@@ -50,27 +50,21 @@ app.add_middleware(
 device = torch.device("cpu")
 print(f"✅ Using device: {device}")
 
-# Link Dropbox direct download
-url = "https://www.dropbox.com/scl/fi/asxj6i1lt4k9ydjnnwshy/asr_model_epoch3.pt?rlkey=tbn0jur4g9eiac991n6vvxryt&st=3nz0mhse&dl=1"
-model_path = "asr_model_epoch3.pt"
+# Link model trên Dropbox (dl=1 để tải trực tiếp)
+model_url = "https://www.dropbox.com/scl/fi/asxj6i1lt4k9ydjnnwshy/asr_model_epoch3.pt?rlkey=tbn0jur4g9eiac991n6vvxryt&dl=1"
+model_path = "/app/asr_model_epoch3.pt"  # lưu vào thư mục /app (Railway container)
 
-# Tải model nếu chưa có trong container
+# Nếu file chưa tồn tại thì tải xuống
 if not os.path.exists(model_path):
     print("⬇️ Downloading model from Dropbox...")
-    r = requests.get(url, allow_redirects=True)
-    with open(model_path, "wb") as f:
-        f.write(r.content)
+    r = requests.get(model_url, allow_redirects=True)
+    open(model_path, "wb").write(r.content)
 
-print("✅ Model ready:", model_path)
-
-# Load Whisper processor & model base
 asr_processor = WhisperProcessor.from_pretrained("openai/whisper-tiny", task="transcribe", language="en")
 asr_model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny")
 
-# Load state_dict từ checkpoint nếu có
 try:
-    state_dict = torch.load(model_path, map_location=device)
-    asr_model.load_state_dict(state_dict)
+    asr_model.load_state_dict(torch.load(model_path, map_location=device))
     print(f"✅ Successfully loaded custom ASR checkpoint from: {model_path}")
 except Exception as e:
     print(f"❌ Error loading checkpoint: {e}. Using base Whisper model instead.")
@@ -256,4 +250,5 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
