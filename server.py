@@ -12,10 +12,12 @@ import json
 import tempfile
 from faster_whisper import WhisperModel
 from pydub import AudioSegment
+import wave  # Thêm wave module để tạo WAV thủ công nếu pydub fail
 from functools import lru_cache
 import time
 import logging
 import mimetypes
+import struct  # Để pack RIFF header
 
 # Cấu hình logging
 logging.basicConfig(level=logging.INFO)
@@ -93,7 +95,7 @@ async def process_audio_file(file: UploadFile):
     mime_type = file.content_type or mime_type_from_filename or ""
     logger.info(f"Detected MIME type: '{mime_type}' (filename: {file.filename})")
 
-    # Sửa lỗi: Chấp nhận cả "video/webm" (audio-only từ browser) và "audio/webm", "audio/wav"
+    # Chấp nhận cả "video/webm" (audio-only từ browser) và "audio/webm", "audio/wav"
     is_wav = mime_type.startswith("audio/wav") or mime_type.startswith("audio/wave") or file.filename and file.filename.lower().endswith(('.wav', '.wave'))
     is_webm = mime_type.startswith(("video/webm", "audio/webm")) or file.filename and file.filename.lower().endswith('.webm')
 
@@ -118,9 +120,54 @@ async def process_audio_file(file: UploadFile):
         logger.info("Converting audio to 16kHz mono...")
         audio_segment = audio_segment.set_frame_rate(16000).set_channels(1).set_sample_width(2)
         
-        # Export sang WAV (faster-whisper chỉ hỗ trợ WAV tốt)
-        tmp_wav_path = tempfile.mktemp(suffix=".wav")  # Sử dụng mktemp để tránh conflict
+        # Sửa lỗi: Sử dụng NamedTemporaryFile cho WAV để đảm bảo write đúng
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav:
+            tmp_wav_path = tmp_wav.name
         audio_segment.export(tmp_wav_path, format="wav")
+        
+        # Validation WAV file sau export
+        if os.path.getsize(tmp_wav_path) < 44:  # RIFF header ít nhất 44 bytes
+            logger.error(f"WAV file too small: {os.path.getsize(tmp_wav_path)} bytes. Rebuilding header.")
+            # Fallback: Export raw PCM và tạo WAV thủ công
+            raw_path = tempfile.mktemp(suffix=".raw")
+            audio_segment.export(raw_path, format="raw", sample_width=2, frame_rate=16000, channels=1)
+            raw_data = open(raw_path, 'rb').read()
+            os.unlink(raw_path)
+            
+            # Tạo WAV header thủ công (RIFF + WAVE + fmt + data)
+            num_samples = len(raw_data) // 2  # 16-bit = 2 bytes/sample
+            data_size = len(raw_data)
+            file_size = data_size + 36  # Header size
+            
+            with open(tmp_wav_path, 'wb') as wav_file:
+                # RIFF header
+                wav_file.write(b'RIFF')
+                wav_file.write(struct.pack('<I', file_size))
+                wav_file.write(b'WAVE')
+                # fmt chunk
+                wav_file.write(b'fmt ')
+                wav_file.write(struct.pack('<I', 16))  # Subchunk1Size
+                wav_file.write(struct.pack('<H', 1))    # AudioFormat (PCM)
+                wav_file.write(struct.pack('<H', 1))    # NumChannels (mono)
+                wav_file.write(struct.pack('<I', 16000)) # SampleRate
+                wav_file.write(struct.pack('<I', 32000)) # ByteRate (16000 * 2 * 1)
+                wav_file.write(struct.pack('<H', 2))     # BlockAlign (2 bytes)
+                wav_file.write(struct.pack('<H', 16))    # BitsPerSample
+                # data chunk
+                wav_file.write(b'data')
+                wav_file.write(struct.pack('<I', data_size))
+                wav_file.write(raw_data)
+            
+            logger.info(f"Rebuilt WAV header. New size: {os.path.getsize(tmp_wav_path)} bytes")
+        
+        # Kiểm tra WAV có đọc được không
+        try:
+            with wave.open(tmp_wav_path, 'rb') as wav:
+                logger.info(f"WAV validation OK: {wav.getnframes()} frames, {wav.getframerate()} Hz, {wav.getnchannels()} channels")
+        except Exception as val_e:
+            logger.error(f"WAV validation failed: {val_e}")
+            raise ValueError("Generated WAV file is invalid")
+        
         logger.info(f"Audio converted to WAV at {tmp_wav_path} in {time.time() - start_time:.2f}s")
         
         return tmp_wav_path
