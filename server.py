@@ -12,11 +12,12 @@ import os
 import aiohttp
 import json
 import io
+import tempfile
 from pydub import AudioSegment
 
 # Giả định bạn có file scoring.py
 try:
-    from app.backend.utils.scoring import score_transcription
+    from utils.scoring import score_transcription
 except ImportError:
     def score_transcription(transcription, target):
         print("Warning: 'score_transcription' not found. Using dummy scoring.")
@@ -75,22 +76,16 @@ class ChatMessage(BaseModel):
 #  HELPER FUNCTION
 # ------------------
 async def process_audio_file(file: UploadFile):
-    try:
-        file_content = await file.read()
-        audio_stream = io.BytesIO(file_content)
-        
-        audio_segment = AudioSegment.from_file(audio_stream)
-        audio_segment = audio_segment.set_frame_rate(16000).set_channels(1)
-        
-        wav_stream = io.BytesIO()
-        audio_segment.export(wav_stream, format="wav")
-        wav_stream.seek(0)
-
-        waveform, sample_rate = torchaudio.load(wav_stream)
-        return waveform.to(device), sample_rate
-    except Exception as e:
-        print(f"❌ Error processing audio file '{file.filename}': {e}")
-        raise ValueError(f"Could not process audio file. It might be corrupted or in an unsupported format. Reason: {e}")
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
+        tmp.write(await file.read())
+        tmp_path = tmp.name
+    waveform, sample_rate = torchaudio.load(tmp_path)
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+    if sample_rate != 16000:
+        resampler = torchaudio.transforms.Resample(sample_rate, 16000)
+        waveform = resampler(waveform)
+    return waveform.to(device), 16000, tmp_path
 
 # ------------------------------------
 #  API ENDPOINTS
@@ -208,3 +203,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
