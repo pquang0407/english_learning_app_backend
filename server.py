@@ -5,15 +5,12 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
-import torch
-import torchaudio
-from transformers import WhisperProcessor, WhisperForConditionalGeneration
 import os
 import aiohttp
 import json
-import io
 import tempfile
-from pydub import AudioSegment
+from faster_whisper import WhisperModel  # Thay thế transformers bằng faster-whisper
+from pydub import AudioSegment  # Để normalize và resample audio nếu cần
 
 # Giả định bạn có file scoring.py
 try:
@@ -42,16 +39,14 @@ app.add_middleware(
 # ------------------
 #  MODEL LOADING & CONFIG
 # ------------------
-device = torch.device("cpu")
+device = "cpu"  # Giữ CPU vì Railway không hỗ trợ GPU miễn phí
 print(f"✅ Using device: {device}")
 
 try:
-    print("⬇️  Loading ASR model from Hugging Face Hub...")
-    asr_processor = WhisperProcessor.from_pretrained("openai/whisper-tiny", task="transcribe", language="en")
-    asr_model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny")
-    asr_model.to(device)
-    asr_model.eval()
-    print("✅ ASR model loaded successfully.")
+    print("⬇️  Loading Faster-Whisper model...")
+    # Sử dụng mô hình tiny.en cho tiếng Anh, compute_type="int8" để tối ưu tốc độ trên CPU
+    asr_model = WhisperModel("tiny.en", device=device, compute_type="int8")
+    print("✅ Faster-Whisper model loaded successfully.")
 except Exception as e:
     print(f"❌ Critical error loading ASR model: {e}")
     asr_model = None
@@ -76,16 +71,22 @@ class ChatMessage(BaseModel):
 #  HELPER FUNCTION
 # ------------------
 async def process_audio_file(file: UploadFile):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
-        tmp.write(await file.read())
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail="Empty audio file uploaded")
+    if len(content) > 5 * 1024 * 1024:  # Giới hạn 5MB (~30 giây audio) để tránh chậm
+        raise HTTPException(status_code=413, detail="Audio file too large. Max 30 seconds.")
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+        tmp.write(content)
         tmp_path = tmp.name
-    waveform, sample_rate = torchaudio.load(tmp_path)
-    if waveform.shape[0] > 1:
-        waveform = waveform.mean(dim=0, keepdim=True)
-    if sample_rate != 16000:
-        resampler = torchaudio.transforms.Resample(sample_rate, 16000)
-        waveform = resampler(waveform)
-    return waveform.to(device), 16000, tmp_path
+
+    # Sử dụng pydub để normalize và force 16kHz mono (tăng tốc và tránh lỗi unpack)
+    audio_segment = AudioSegment.from_file(tmp_path)
+    audio_segment = audio_segment.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+    audio_segment.export(tmp_path, format="wav")  # Ghi đè file tạm với định dạng chuẩn
+
+    return tmp_path  # Trả về path để faster-whisper dùng trực tiếp
 
 # ------------------------------------
 #  API ENDPOINTS
@@ -95,19 +96,20 @@ async def practice(file: UploadFile = File(...), target: str = Form(...)):
     if not asr_model:
         raise HTTPException(status_code=503, detail="ASR model is not available.")
     try:
-        waveform, sample_rate = await process_audio_file(file)
+        tmp_path = await process_audio_file(file)
         
-        input_features = asr_processor(waveform.squeeze(0), sampling_rate=sample_rate, return_tensors="pt").input_features.to(device)
-        with torch.no_grad():
-            generated_ids = asr_model.generate(input_features, max_length=448)
-        
-        transcription = asr_processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
-        print(f"🎤 Transcription for practice: '{transcription}'")
+        # Sử dụng faster-whisper để transcribe nhanh hơn
+        segments, info = asr_model.transcribe(tmp_path, beam_size=5, language="en")
+        transcription = " ".join([segment.text for segment in segments]).strip()
+        print(f"🎤 Transcription for practice: '{transcription}' (Duration: {info.duration} seconds)")
         
         result = score_transcription(transcription, target)
+        os.unlink(tmp_path)  # Xóa file tạm
         return result
     except Exception as e:
         print(f"🔥 Error in /practice endpoint: {e}")
+        if 'tmp_path' in locals():
+            os.unlink(tmp_path)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/transcribe")
@@ -115,16 +117,21 @@ async def transcribe(file: UploadFile = File(...)):
     if not asr_model:
         raise HTTPException(status_code=503, detail="ASR model is not available.")
     try:
-        waveform, sample_rate = await process_audio_file(file)
-        input_features = asr_processor(waveform.squeeze(0), sampling_rate=sample_rate, return_tensors="pt").input_features.to(device)
-        with torch.no_grad():
-            generated_ids = asr_model.generate(input_features, max_length=448)
-        transcription = asr_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        return {"transcription": transcription.strip()}
+        tmp_path = await process_audio_file(file)
+        
+        # Sử dụng faster-whisper
+        segments, info = asr_model.transcribe(tmp_path, beam_size=5, language="en")
+        transcription = " ".join([segment.text for segment in segments]).strip()
+        
+        os.unlink(tmp_path)
+        return {"transcription": transcription}
     except Exception as e:
         print(f"🔥 Error in /transcribe endpoint: {e}")
+        if 'tmp_path' in locals():
+            os.unlink(tmp_path)
         raise HTTPException(status_code=500, detail=str(e))
 
+# Các endpoint khác giữ nguyên (chat, tongue-twisters, topics, generate-topics)
 @app.post("/chat")
 async def chat(chat_message: ChatMessage):
     try:
@@ -139,7 +146,7 @@ async def chat(chat_message: ChatMessage):
         
         async with aiohttp.ClientSession() as session:
             async with session.post(GEMINI_API_URL, json=payload) as response:
-                response.raise_for_status() # This will raise an error for 4xx/5xx responses
+                response.raise_for_status()
                 result = await response.json()
         
         if result and result.get('candidates'):
@@ -149,7 +156,6 @@ async def chat(chat_message: ChatMessage):
         
         raise HTTPException(status_code=500, detail="Gemini API returned an invalid response format.")
     except aiohttp.ClientResponseError as e:
-        # Bắt lỗi cụ thể từ API call
         print(f"🔥 Gemini API Error: Status {e.status}, Message: {e.message}")
         raise HTTPException(status_code=502, detail=f"Failed to communicate with the AI service. Reason: {e.message}")
     except Exception as e:
@@ -167,7 +173,6 @@ async def get_tongue_twisters():
 
 @app.get("/topics")
 async def get_topics():
-    # This endpoint now calls the generator function directly.
     return await generate_topics()
 
 @app.get("/generate-topics")
@@ -203,4 +208,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
