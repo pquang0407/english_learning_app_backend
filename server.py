@@ -98,13 +98,12 @@ async def practice(file: UploadFile = File(...), target: str = Form(...)):
     try:
         tmp_path = await process_audio_file(file)
         
-        # Sử dụng faster-whisper để transcribe nhanh hơn
         segments, info = asr_model.transcribe(tmp_path, beam_size=5, language="en")
         transcription = " ".join([segment.text for segment in segments]).strip()
         print(f"🎤 Transcription for practice: '{transcription}' (Duration: {info.duration} seconds)")
         
         result = score_transcription(transcription, target)
-        os.unlink(tmp_path)  # Xóa file tạm
+        os.unlink(tmp_path)
         return result
     except Exception as e:
         print(f"🔥 Error in /practice endpoint: {e}")
@@ -119,7 +118,6 @@ async def transcribe(file: UploadFile = File(...)):
     try:
         tmp_path = await process_audio_file(file)
         
-        # Sử dụng faster-whisper
         segments, info = asr_model.transcribe(tmp_path, beam_size=5, language="en")
         transcription = " ".join([segment.text for segment in segments]).strip()
         
@@ -131,52 +129,47 @@ async def transcribe(file: UploadFile = File(...)):
             os.unlink(tmp_path)
         raise HTTPException(status_code=500, detail=str(e))
 
-# Các endpoint khác giữ nguyên (chat, tongue-twisters, topics, generate-topics)
+# Sửa lỗi logic chat để không dùng streaming cùng với systemInstruction
 @app.post("/chat")
 async def chat(chat_message: ChatMessage):
     try:
         prompt_parts = []
+        # Chuyển system prompt vào nội dung chat
+        if chat_message.system_prompt_override:
+            prompt_parts.append({"role": "model", "parts": [{"text": chat_message.system_prompt_override}]})
+        
+        # Thêm lịch sử cuộc trò chuyện
         for msg in chat_message.history:
             if msg.get('user_message') and msg.get('chatbot_response'):
                 prompt_parts.append({"role": "user", "parts": [{"text": msg['user_message']}]})
                 prompt_parts.append({"role": "model", "parts": [{"text": msg['chatbot_response']}]})
+        
+        # Thêm tin nhắn hiện tại
         prompt_parts.append({"role": "user", "parts": [{"text": chat_message.message}]})
         
-        system_instruction = chat_message.system_prompt_override or "Your name is Lilly. You are a friendly English tutor..."
-
-        # Thêm stream=True vào payload
         payload = {
-            "contents": prompt_parts, 
-            "systemInstruction": {"parts": [{"text": system_instruction}]},
-            "stream": True # Bật streaming cho API Gemini
+            "contents": prompt_parts,
+            # Bỏ "stream": True vì nó không tương thích với systemInstruction
         }
         
         async with aiohttp.ClientSession() as session:
             async with session.post(GEMINI_API_URL, json=payload) as response:
                 response.raise_for_status()
-
-                # Kiểm tra xem có phải là streaming không
-                if response.headers.get('Content-Type') == 'text/event-stream':
-                    # Trả về StreamingResponse để truyền dữ liệu về client
-                    return StreamingResponse(
-                        content=response.content.iter_any(), 
-                        media_type='text/event-stream'
-                    )
-                else:
-                    # Xử lý response thông thường (nếu stream không hoạt động)
-                    result = await response.json()
-                    if result and result.get('candidates'):
-                        generated_text = result['candidates'][0].get('content', {}).get('parts', [{}])[0].get('text')
-                        if generated_text:
-                            return {"response": generated_text.strip()}
-                    raise HTTPException(status_code=500, detail="Gemini API returned an invalid response format.")
+                
+                result = await response.json()
+                if result and result.get('candidates'):
+                    generated_text = result['candidates'][0].get('content', {}).get('parts', [{}])[0].get('text')
+                    if generated_text:
+                        return {"response": generated_text.strip()}
+                    
+        raise HTTPException(status_code=500, detail="Gemini API returned an invalid or empty response.")
 
     except aiohttp.ClientResponseError as e:
         print(f"🔥 Gemini API Error: Status {e.status}, Message: {e.message}")
         raise HTTPException(status_code=502, detail=f"Failed to communicate with the AI service. Reason: {e.message}")
     except Exception as e:
         print(f"🔥 Error in /chat endpoint: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
 @app.get("/tongue-twisters")
 async def get_tongue_twisters():
@@ -194,9 +187,9 @@ async def get_topics():
 @app.get("/generate-topics")
 async def generate_topics():
     try:
-        payload = { 
-            "contents": [{"parts": [{"text": "Generate 5 English pronunciation topics for learners, from easy to hard. For each topic, create a title and 5-10 example sentences. The response must be a valid JSON array of objects, where each object has 'id', 'title', and 'sentences' keys."}]}], 
-            "generationConfig": {"responseMimeType": "application/json"} 
+        payload = {
+            "contents": [{"parts": [{"text": "Generate 5 English pronunciation topics for learners, from easy to hard. For each topic, create a title and 5-10 example sentences. The response must be a valid JSON array of objects, where each object has 'id', 'title', and 'sentences' keys."}]}],
+            "generationConfig": {"responseMimeType": "application/json"}
         }
         
         async with aiohttp.ClientSession() as session:
@@ -218,11 +211,12 @@ async def generate_topics():
         raise HTTPException(status_code=500, detail=str(e))
 
 # ------------------
-#  RUN THE APP
+# RUN THE APP
 # ------------------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
 
 
