@@ -8,14 +8,11 @@ from typing import List, Optional
 import torch
 import torchaudio
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
-import tempfile
 import os
 import aiohttp
 import json
-import re
-import random
-from pydub import AudioSegment # <-- IMPORT PYDUB
-import io # <-- IMPORT IO ĐỂ XỬ LÝ DỮ LIỆU TRONG BỘ NHỚ
+import io 
+from pydub import AudioSegment
 
 # Giả định bạn có file scoring.py
 try:
@@ -47,8 +44,6 @@ app.add_middleware(
 device = torch.device("cpu")
 print(f"✅ Using device: {device}")
 
-# Tải model từ Hugging Face Hub là cách làm ổn định nhất
-# Việc tải từ Google Drive URL trực tiếp trong code là không khả thi
 try:
     print("⬇️  Loading ASR model from Hugging Face Hub...")
     asr_processor = WhisperProcessor.from_pretrained("openai/whisper-tiny", task="transcribe", language="en")
@@ -60,15 +55,14 @@ except Exception as e:
     print(f"❌ Critical error loading ASR model: {e}")
     asr_model = None
 
+# !!! QUAN TRỌNG: SỬA LỖI Ở ĐÂY !!!
+# LƯU Ý: Rất khuyến khích sử dụng biến môi trường thay vì hardcode key
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyDBB1dDLi0F5rJI2QSjY8AANd5j2mP_vfQ")
-
 if GEMINI_API_KEY == "AIzaSyDBB1dDLi0F5rJI2QSjY8AANd5j2mP_vfQ":
     print("⚠️ WARNING: Using a hardcoded placeholder Gemini API Key.")
+
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
 
-
-
-# ------------------
 # ------------------
 #  PYDANTIC MODELS
 # ------------------
@@ -77,67 +71,37 @@ class ChatMessage(BaseModel):
     history: list[dict] = []
     system_prompt_override: Optional[str] = None
 
-# (Các model khác cho analyze-pronunciation có thể thêm vào đây nếu cần)
-
 # ------------------
-#  HELPER FUNCTION (Sử dụng Pydub, không cần FFmpeg)
+#  HELPER FUNCTION
 # ------------------
 async def process_audio_file(file: UploadFile):
-    """
-    Reads an uploaded audio file, converts it to a standard WAV format in memory using pydub,
-    and then loads it with torchaudio.
-    """
     try:
-        print(f"📄 Received file: {file.filename} ({file.content_type})")
-        # Đọc nội dung file vào bộ nhớ
         file_content = await file.read()
-        
-        # Tạo một đối tượng file-like trong bộ nhớ
         audio_stream = io.BytesIO(file_content)
-
-        # Sử dụng pydub để đọc audio từ stream, bất kể định dạng gốc
-        print("🔄 Converting audio using pydub...")
+        
         audio_segment = AudioSegment.from_file(audio_stream)
+        audio_segment = audio_segment.set_frame_rate(16000).set_channels(1)
         
-        # Chuẩn hóa audio: 1 kênh (mono), sample rate 16kHz
-        audio_segment = audio_segment.set_frame_rate(16000)
-        audio_segment = audio_segment.set_channels(1)
-        
-        print("✅ Audio standardized to 16kHz mono WAV format.")
-
-        # Xuất audio đã chuẩn hóa ra một stream WAV trong bộ nhớ
         wav_stream = io.BytesIO()
         audio_segment.export(wav_stream, format="wav")
-        wav_stream.seek(0) # Rất quan trọng: Đưa con trỏ về đầu stream
+        wav_stream.seek(0)
 
-        # Tải waveform từ stream WAV bằng torchaudio
         waveform, sample_rate = torchaudio.load(wav_stream)
-        
-        print(f"🎧 Loaded audio with torchaudio. Sample rate: {sample_rate}, Shape: {waveform.shape}")
-        
-        # Không cần file tạm, không cần xóa
         return waveform.to(device), sample_rate
-
     except Exception as e:
-        print(f"❌ Error processing audio file: {e}")
-        # Ném ra lỗi để endpoint có thể bắt và xử lý
-        raise ValueError(f"Could not process audio file '{file.filename}'. Reason: {e}")
-
+        print(f"❌ Error processing audio file '{file.filename}': {e}")
+        raise ValueError(f"Could not process audio file. It might be corrupted or in an unsupported format. Reason: {e}")
 
 # ------------------------------------
 #  API ENDPOINTS
 # ------------------------------------
-
 @app.post("/practice")
 async def practice(file: UploadFile = File(...), target: str = Form(...)):
     if not asr_model:
         raise HTTPException(status_code=503, detail="ASR model is not available.")
-    
     try:
-        # Hàm mới không trả về tmp_path nữa
         waveform, sample_rate = await process_audio_file(file)
         
-        print(f"🧠 Performing practice scoring. Target: '{target}'")
         input_features = asr_processor(waveform.squeeze(0), sampling_rate=sample_rate, return_tensors="pt").input_features.to(device)
         with torch.no_grad():
             generated_ids = asr_model.generate(input_features, max_length=448)
@@ -146,13 +110,10 @@ async def practice(file: UploadFile = File(...), target: str = Form(...)):
         print(f"🎤 Transcription for practice: '{transcription}'")
         
         result = score_transcription(transcription, target)
-        print(f"📊 Scoring result: {result}")
         return result
-        
     except Exception as e:
         print(f"🔥 Error in /practice endpoint: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.post("/transcribe")
 async def transcribe(file: UploadFile = File(...)):
@@ -160,23 +121,17 @@ async def transcribe(file: UploadFile = File(...)):
         raise HTTPException(status_code=503, detail="ASR model is not available.")
     try:
         waveform, sample_rate = await process_audio_file(file)
-        
-        print("🧠 Performing transcription...")
         input_features = asr_processor(waveform.squeeze(0), sampling_rate=sample_rate, return_tensors="pt").input_features.to(device)
         with torch.no_grad():
             generated_ids = asr_model.generate(input_features, max_length=448)
         transcription = asr_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        
-        print(f"🎤 Transcription result: '{transcription.strip()}'")
         return {"transcription": transcription.strip()}
     except Exception as e:
         print(f"🔥 Error in /transcribe endpoint: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# Các endpoint khác giữ nguyên vì chúng không xử lý audio
 @app.post("/chat")
 async def chat(chat_message: ChatMessage):
-    # ... code giữ nguyên
     try:
         prompt_parts = []
         for msg in chat_message.history:
@@ -186,51 +141,70 @@ async def chat(chat_message: ChatMessage):
         prompt_parts.append({"role": "user", "parts": [{"text": chat_message.message}]})
         system_instruction = chat_message.system_prompt_override or "Your name is Lilly. You are a friendly English tutor..."
         payload = {"contents": prompt_parts, "systemInstruction": {"parts": [{"text": system_instruction}]}}
+        
         async with aiohttp.ClientSession() as session:
             async with session.post(GEMINI_API_URL, json=payload) as response:
-                response.raise_for_status()
+                response.raise_for_status() # This will raise an error for 4xx/5xx responses
                 result = await response.json()
+        
         if result and result.get('candidates'):
             generated_text = result['candidates'][0].get('content', {}).get('parts', [{}])[0].get('text')
             if generated_text:
                 return {"response": generated_text.strip()}
-        return {"response": "Sorry, I couldn't generate a response."}
+        
+        raise HTTPException(status_code=500, detail="Gemini API returned an invalid response format.")
+    except aiohttp.ClientResponseError as e:
+        # Bắt lỗi cụ thể từ API call
+        print(f"🔥 Gemini API Error: Status {e.status}, Message: {e.message}")
+        raise HTTPException(status_code=502, detail=f"Failed to communicate with the AI service. Reason: {e.message}")
     except Exception as e:
-        return {"response": f"An error occurred: {str(e)}"}
+        print(f"🔥 Error in /chat endpoint: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/tongue-twisters")
 async def get_tongue_twisters():
-    # ... code giữ nguyên
-    twisters = ["She sells seashells...", "Peter Piper..."]
+    twisters = [
+        "She sells seashells by the seashore.",
+        "Peter Piper picked a peck of pickled peppers.",
+        "How much wood would a woodchuck chuck if a woodchuck could chuck wood?",
+    ]
     return {"tongue_twisters": twisters}
 
 @app.get("/topics")
 async def get_topics():
-    # ... code giữ nguyên
+    # This endpoint now calls the generator function directly.
     return await generate_topics()
 
 @app.get("/generate-topics")
 async def generate_topics():
-    # ... code giữ nguyên
     try:
-        payload = { "contents": [{"parts": [{"text": "Generate 5 English pronunciation topics..."}]}], "generationConfig": {"responseMimeType": "application/json"} }
+        payload = { 
+            "contents": [{"parts": [{"text": "Generate 5 English pronunciation topics for learners, from easy to hard. For each topic, create a title and 5-10 example sentences. The response must be a valid JSON array of objects, where each object has 'id', 'title', and 'sentences' keys."}]}], 
+            "generationConfig": {"responseMimeType": "application/json"} 
+        }
+        
         async with aiohttp.ClientSession() as session:
             async with session.post(GEMINI_API_URL, json=payload) as response:
-                response.raise_for_status()
+                if response.status != 200:
+                    error_body = await response.text()
+                    print(f"🔥 Gemini API Error for Topics: Status {response.status}, Body: {error_body}")
+                    raise HTTPException(status_code=502, detail=f"AI service failed to generate topics. Status: {response.status}")
                 result = await response.json()
+
         if result and result.get('candidates'):
             generated_text = result['candidates'][0].get('content', {}).get('parts', [{}])[0].get('text')
             if generated_text:
                 return {"topics": json.loads(generated_text)}
-        return {"error": "Failed to generate topics."}
+        
+        raise HTTPException(status_code=500, detail="Gemini API returned an invalid format for topics.")
     except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
+        print(f"🔥 Error in /generate-topics endpoint: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ------------------
 #  RUN THE APP
 # ------------------
 if __name__ == "__main__":
     import uvicorn
-    # Port được lấy từ biến môi trường, phù hợp cho Railway
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
