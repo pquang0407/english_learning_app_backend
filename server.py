@@ -10,15 +10,12 @@ import os
 import aiohttp
 import json
 import tempfile
-import subprocess  # Thêm cho FFmpeg subprocess
 from faster_whisper import WhisperModel
 from pydub import AudioSegment
-import wave  # Để validation WAV
 from functools import lru_cache
 import time
 import logging
 import mimetypes
-import struct  # Để pack header nếu cần
 
 # Cấu hình logging
 logging.basicConfig(level=logging.INFO)
@@ -62,6 +59,7 @@ except Exception as e:
     logger.error(f"Critical error loading ASR model: {e}")
     asr_model = None
 
+# !!! QUAN TRỌNG: SỬA LỖI Ở ĐÂY !!!
 # LƯU Ý: Rất khuyến khích sử dụng biến môi trường thay vì hardcode key
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyCjT592M8WRJDr6yFs3oTgog-m-cDtZFRc")
 if GEMINI_API_KEY == "AIzaSyCjT592M8WRJDr6yFs3oTgog-m-cDtZFRc":
@@ -91,133 +89,44 @@ async def process_audio_file(file: UploadFile):
         logger.error("Audio file too large. Size: {} bytes".format(len(content)))
         raise HTTPException(status_code=413, detail="Audio file too large. Max 30 seconds (~5MB).")
 
-    # Lấy MIME type từ filename hoặc content_type từ request
-    mime_type_from_filename, _ = mimetypes.guess_type(file.filename or "")
-    mime_type = file.content_type or mime_type_from_filename or ""
-    logger.info(f"Detected MIME type: '{mime_type}' (filename: {file.filename})")
-
-    # Chấp nhận cả "video/webm" (audio-only từ browser) và "audio/webm", "audio/wav"
-    is_wav = mime_type.startswith("audio/wav") or mime_type.startswith("audio/wave") or file.filename and file.filename.lower().endswith(('.wav', '.wave'))
-    is_webm = mime_type.startswith(("video/webm", "audio/webm")) or file.filename and file.filename.lower().endswith('.webm')
-
-    if not (is_wav or is_webm):
-        logger.error(f"Invalid audio format: {mime_type}. Only WAV or WebM supported.")
+    # Kiểm tra MIME type từ filename
+    mime_type, _ = mimetypes.guess_type(file.filename or "")
+    if not mime_type or mime_type not in ["audio/wav", "audio/wave", "audio/webm"]:
+        logger.error(f"Invalid audio format: {mime_type}")
         raise HTTPException(status_code=400, detail="Invalid audio format. Only WAV or WebM supported.")
 
-    # Xác định format input
-    input_format = "wav" if is_wav else "webm"
-    logger.info(f"Input format detected: {input_format}")
-
-    # Lưu file tạm input
-    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{input_format}") as tmp:
+    # Lưu file tạm
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".webm" if mime_type == "audio/webm" else ".wav") as tmp:
         tmp.write(content)
         tmp_path = tmp.name
 
-    tmp_wav_path = None
     try:
-        if is_wav:
-            # Nếu input là WAV, copy trực tiếp (tránh convert lỗi)
-            tmp_wav_path = tempfile.mktemp(suffix=".wav")
-            with open(tmp_path, 'rb') as src, open(tmp_wav_path, 'wb') as dst:
-                dst.write(src.read())
-            logger.info(f"Copied WAV input to {tmp_wav_path}")
-        else:
-            # Sửa lỗi: Dùng FFmpeg subprocess để convert WebM sang WAV trực tiếp (bypass pydub)
-            logger.info("Using FFmpeg to convert WebM to WAV...")
-            tmp_wav_path = tempfile.mktemp(suffix=".wav")
-            cmd = [
-                'ffmpeg', '-y',  # Overwrite output
-                '-i', tmp_path,  # Input WebM
-                '-ar', '16000',  # Sample rate 16kHz
-                '-ac', '1',      # Mono
-                '-f', 'wav',     # Output WAV
-                '-acodec', 'pcm_s16le',  # PCM 16-bit little-endian (fix RIFF header)
-                tmp_wav_path
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            if result.returncode != 0:
-                logger.error(f"FFmpeg error: {result.stderr}")
-                raise ValueError(f"FFmpeg conversion failed: {result.stderr}")
-            logger.info(f"FFmpeg converted WebM to WAV: {tmp_wav_path} (size: {os.path.getsize(tmp_wav_path)} bytes)")
-
-        # Resample nếu cần (nếu FFmpeg không chính xác)
-        if os.path.getsize(tmp_wav_path) > 44:  # Kiểm tra header tồn tại
-            audio_segment = AudioSegment.from_wav(tmp_wav_path)
-            audio_segment = audio_segment.set_frame_rate(16000).set_channels(1).set_sample_width(2)
-            audio_segment.export(tmp_wav_path, format="wav")
-            logger.info("Resampled with pydub to ensure 16kHz mono")
-
-        # Validation WAV file
-        if os.path.getsize(tmp_wav_path) < 44:
-            logger.error(f"WAV file too small: {os.path.getsize(tmp_wav_path)} bytes. Rebuilding header.")
-            # Fallback rebuild (cải thiện: dùng raw từ FFmpeg nếu có)
-            raw_path = tempfile.mktemp(suffix=".raw")
-            cmd_raw = [
-                'ffmpeg', '-y', '-i', tmp_path,
-                '-ar', '16000', '-ac', '1', '-f', 's16le',  # Raw PCM 16-bit
-                raw_path
-            ]
-            subprocess.run(cmd_raw, capture_output=True, timeout=30)
-            raw_data = open(raw_path, 'rb').read()
-            os.unlink(raw_path)
-            
-            # Tạo WAV header thủ công (PCM 16-bit mono 16kHz)
-            num_samples = len(raw_data) // 2
-            data_size = len(raw_data)
-            file_size = data_size + 36
-            
-            with open(tmp_wav_path, 'wb') as wav_file:
-                # RIFF header
-                wav_file.write(b'RIFF')
-                wav_file.write(struct.pack('<I', file_size))
-                wav_file.write(b'WAVE')
-                # fmt chunk
-                wav_file.write(b'fmt ')
-                wav_file.write(struct.pack('<I', 16))
-                wav_file.write(struct.pack('<H', 1))  # PCM
-                wav_file.write(struct.pack('<H', 1))  # Mono
-                wav_file.write(struct.pack('<I', 16000))
-                wav_file.write(struct.pack('<I', 32000))  # Byte rate
-                wav_file.write(struct.pack('<H', 2))  # Block align
-                wav_file.write(struct.pack('<H', 16))  # Bits per sample
-                # data chunk
-                wav_file.write(b'data')
-                wav_file.write(struct.pack('<I', data_size))
-                wav_file.write(raw_data)
-            
-            logger.info(f"Rebuilt WAV header from raw PCM. Size: {os.path.getsize(tmp_wav_path)} bytes")
-
-        # Validation cuối
-        try:
-            with wave.open(tmp_wav_path, 'rb') as wav:
-                frames = wav.getnframes()
-                rate = wav.getframerate()
-                channels = wav.getnchannels()
-                logger.info(f"WAV validation OK: {frames} frames, {rate} Hz, {channels} channels")
-            if frames == 0:
-                raise ValueError("WAV file has no audio frames")
-        except Exception as val_e:
-            logger.error(f"WAV validation failed: {val_e}")
-            raise ValueError(f"Generated WAV is invalid: {val_e}")
-
-        logger.info(f"Audio processing complete in {time.time() - start_time:.2f}s")
+        # Load và convert audio
+        logger.info(f"Loading audio from {tmp_path} (MIME: {mime_type})")
+        audio_segment = AudioSegment.from_file(tmp_path, format="webm" if mime_type == "audio/webm" else "wav")
+        logger.info("Converting audio to 16kHz mono...")
+        audio_segment = audio_segment.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+        
+        # Export sang WAV (faster-whisper chỉ hỗ trợ WAV tốt)
+        tmp_wav_path = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
+        audio_segment.export(tmp_wav_path, format="wav")
+        logger.info(f"Audio converted to WAV at {tmp_wav_path} in {time.time() - start_time:.2f}s")
+        
         return tmp_wav_path
     except Exception as e:
         logger.error(f"Error processing audio: {e}")
-        if os.path.exists(tmp_path):
+        if 'tmp_path' in locals():
             os.unlink(tmp_path)
-        if tmp_wav_path and os.path.exists(tmp_wav_path):
+        if 'tmp_wav_path' in locals():
             os.unlink(tmp_wav_path)
         raise HTTPException(status_code=500, detail=f"Failed to process audio: {str(e)}")
-
-# ... (Giữ nguyên các helper functions khác: cached_generate_topics, stream_gemini_response)
 
 @lru_cache(maxsize=1)
 async def cached_generate_topics():
     start_time = time.time()
     payload = {
         "contents": [{"parts": [{"text": "Generate 5 English pronunciation topics for learners, from easy to hard. Each topic should have a title and 5 example sentences. Return a JSON array of objects with 'id', 'title', and 'sentences' keys."}]}],
-        "generationConfig": {"responseMimeType": "application/json", "maxOutputTokens": 500}
+        "generationConfig": {"responseMimeType": "application/json", "maxOutputTokens": 500}  # Giới hạn output để nhanh hơn
     }
     
     async with aiohttp.ClientSession() as session:
@@ -248,13 +157,12 @@ async def stream_gemini_response(payload: dict) -> AsyncGenerator[str, None]:
                 return
             async for chunk in response.content.iter_chunked(1024):
                 if chunk:
-                    yield chunk.decode('utf-8')
+                    yield chunk.decode('utf-8')  # Stream từng chunk
     logger.info(f"Streamed response took {time.time() - start_time:.2f} seconds")
 
 # ------------------
-#  API ENDPOINTS (Giữ nguyên /practice, /transcribe, /chat, /tongue-twisters, /topics, /generate-topics)
+#  API ENDPOINTS
 # ------------------
-# (Copy từ code cũ của bạn cho các endpoint này, vì chúng không thay đổi)
 @app.post("/practice")
 async def practice(file: UploadFile = File(...), target: str = Form(...)):
     if not asr_model:
@@ -264,15 +172,18 @@ async def practice(file: UploadFile = File(...), target: str = Form(...)):
     start_time = time.time()
     tmp_path = None
     try:
+        # Xử lý file audio
         logger.info("Processing audio file...")
         tmp_path = await process_audio_file(file)
         logger.info(f"Audio file processed: {tmp_path}")
         
+        # Transcribe với faster-whisper
         logger.info("Starting transcription...")
         segments, info = asr_model.transcribe(tmp_path, beam_size=5, language="en")
         transcription = " ".join([segment.text for segment in segments]).strip()
         logger.info(f"Transcription completed: '{transcription}' (Duration: {info.duration:.2f}s, Took: {time.time() - start_time:.2f}s)")
         
+        # Score transcription
         logger.info(f"Scoring transcription against target: '{target}'")
         try:
             result = score_transcription(transcription, target)
@@ -283,6 +194,7 @@ async def practice(file: UploadFile = File(...), target: str = Form(...)):
             return result
         except Exception as e:
             logger.error(f"Error in score_transcription: {e}")
+            # Fallback dummy result
             dummy_result = {
                 "score": 0,
                 "matches": [{"word": w, "status": "missing"} for w in target.lower().split()],
@@ -296,6 +208,7 @@ async def practice(file: UploadFile = File(...), target: str = Form(...)):
         logger.error(f"Error in /practice endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Practice failed: {str(e)}")
     finally:
+        # Cleanup file tạm
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.unlink(tmp_path)
@@ -330,12 +243,11 @@ async def transcribe(file: UploadFile = File(...)):
             except Exception as e:
                 logger.error(f"Failed to clean up {tmp_path}: {e}")
 
-# (Giữ nguyên /chat, /tongue-twisters, /topics, /generate-topics từ code cũ)
-
 @app.post("/chat")
 async def chat(chat_message: ChatMessage):
     start_time = time.time()
     try:
+        # Tối ưu: Giới hạn history để giảm payload (chỉ 3 tin nhắn gần nhất)
         history = chat_message.history[-3:] if chat_message.history else []
         prompt_parts = []
         for msg in history:
@@ -349,20 +261,22 @@ async def chat(chat_message: ChatMessage):
             "contents": prompt_parts,
             "systemInstruction": {"parts": [{"text": system_instruction}]},
             "generationConfig": {
-                "maxOutputTokens": 200,
-                "temperature": 0.7,
+                "maxOutputTokens": 200,  # Giới hạn output để nhanh hơn
+                "temperature": 0.7,  # Giảm randomness để xử lý nhanh
                 "topP": 0.8
             }
         }
         
         if chat_message.stream:
+            # Streaming mode
             async def generate():
                 async for chunk in stream_gemini_response(payload):
-                    yield f"data: {json.dumps({'delta': chunk})}\n\n"
+                    yield f"data: {json.dumps({'delta': chunk})}\n\n"  # SSE format cho stream
                 yield "data: [DONE]\n\n"
             
             return StreamingResponse(generate(), media_type="text/event-stream")
         else:
+            # Non-streaming (giữ nguyên cho compatibility)
             async with aiohttp.ClientSession() as session:
                 async with session.post(GEMINI_API_URL, json=payload, timeout=10) as response:
                     response.raise_for_status()
