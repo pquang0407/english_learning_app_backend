@@ -46,8 +46,8 @@ print(f"✅ Using device: {device}")
 
 try:
     print("⬇️  Loading ASR model from Hugging Face Hub...")
-    asr_processor = WhisperProcessor.from_pretrained("openai/whisper-tiny", task="transcribe", language="en")
-    asr_model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny")
+    asr_processor = WhisperProcessor.from_pretrained("openai/whisper-tiny.en")
+    asr_model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny.en")
     asr_model.to(device)
     asr_model.eval()
     print("✅ ASR model loaded successfully.")
@@ -208,3 +208,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
