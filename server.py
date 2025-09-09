@@ -1,9 +1,6 @@
-# ------------------
-#  IMPORTS
-# ------------------
-from fastapi import FastAPI, File, UploadFile, Form
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import List, Optional
 import torch
 import torchaudio
@@ -12,31 +9,25 @@ import tempfile
 import os
 import aiohttp
 import json
-import asyncio
 import re
 import random
-import requests
 
 # Giả định bạn có file scoring.py tại app/backend/utils/scoring.py
-# Nếu không, bạn có thể comment dòng này và hàm score_transcription
 try:
     from app.backend.utils.scoring import score_transcription
 except ImportError:
-    # Cung cấp một hàm giả nếu không tìm thấy file
     def score_transcription(transcription, target):
         print("Warning: 'score_transcription' not found. Using dummy scoring.")
         from difflib import SequenceMatcher
         score = SequenceMatcher(None, transcription.lower(), target.lower()).ratio() * 100
-        matches = [{"word": w, "status": "correct" if w in transcription else "missing"} for w in target.split()]
+        matches = [{"word": w, "status": "correct" if w in transcription.lower().split() else "missing"} for w in target.lower().split()]
         return {"score": int(score), "matches": matches, "transcription": transcription, "target": target}
-
 
 # ------------------
 #  APP INITIALIZATION
 # ------------------
 app = FastAPI()
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -51,31 +42,26 @@ app.add_middleware(
 device = torch.device("cpu")
 print(f"✅ Using device: {device}")
 
-# Link model trên Dropbox (dl=1 để tải trực tiếp)
-model_url = "https://www.dropbox.com/scl/fi/asxj6i1lt4k9ydjnnwshy/asr_model_epoch3.pt?rlkey=tbn0jur4g9eiac991n6vvxryt&dl=1"
-model_path = "/app/asr_model_epoch3.pt"  # lưu vào thư mục /app (Railway container)
-
-# Nếu file chưa tồn tại thì tải xuống
-if not os.path.exists(model_path):
-    print("⬇️ Downloading model from Dropbox...")
-    r = requests.get(model_url, allow_redirects=True)
-    open(model_path, "wb").write(r.content)
-
-asr_processor = WhisperProcessor.from_pretrained("openai/whisper-tiny", task="transcribe", language="en")
-asr_model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny")
-
+# Tải model từ Hugging Face Hub, cách này đáng tin cậy hơn
 try:
-    asr_model.load_state_dict(torch.load(model_path, map_location=device))
-    print(f"✅ Successfully loaded custom ASR checkpoint from: {model_path}")
+    print("⬇️  Loading ASR model from Hugging Face Hub...")
+    asr_processor = WhisperProcessor.from_pretrained("openai/whisper-tiny", task="transcribe", language="en")
+    asr_model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny")
+    asr_model.to(device)
+    asr_model.eval()
+    print("✅ ASR model loaded successfully.")
 except Exception as e:
-    print(f"❌ Error loading checkpoint: {e}. Using base Whisper model instead.")
-
-asr_model.to(device)
-asr_model.eval()
+    print(f"❌ Critical error loading ASR model: {e}")
+    # Nếu không tải được model, ứng dụng không thể hoạt động
+    # Bạn có thể thêm logic để thoát hoặc xử lý lỗi này
+    asr_model = None
 
 # Gemini API configuration
-# LƯU Ý: Hãy chắc chắn rằng bạn đã thay thế bằng API key của chính mình.
-GEMINI_API_KEY = "AIzaSyDBB1dDLi0F5rJI2QSjY8AANd5j2mP_vfQ"  # THAY THẾ BẰNG KEY CỦA BẠN
+# LƯU Ý: Rất khuyến khích sử dụng biến môi trường thay vì hardcode key
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyDBB1dDLi0F5rJI2QSjY8AANd5j2mP_vfQ")
+if GEMINI_API_KEY == "AIzaSyDBB1dDLi0F5rJI2QSjY8AANd5j2mP_vfQ":
+    print("⚠️ WARNING: Using a hardcoded placeholder Gemini API Key.")
+
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
 
 # ------------------
@@ -84,101 +70,95 @@ GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemin
 class ChatMessage(BaseModel):
     message: str
     history: list[dict] = []
-    system_prompt_override: Optional[str] = None # Hỗ trợ kịch bản
-
-class PhonemeResult(BaseModel):
-    phoneme: str
-    is_correct: bool
-
-class WordResult(BaseModel):
-    word: str
-    is_correct: bool
-    phonemes: Optional[List[PhonemeResult]] = None
-
-class AnalysisResult(BaseModel):
-    overall_score: int
-    transcription: str
-    words: List[WordResult]
+    system_prompt_override: Optional[str] = None
 
 # ------------------
-#  HELPER FUNCTION
+#  HELPER FUNCTION (ĐÃ SỬA LỖI)
 # ------------------
 async def process_audio_file(file: UploadFile):
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        tmp.write(await file.read())
+    # Lấy phần mở rộng từ tên tệp gốc (ví dụ: .webm, .wav)
+    file_extension = os.path.splitext(file.filename)[1] if file.filename else ".tmp"
+    
+    # Tạo tệp tạm thời với đúng phần mở rộng
+    with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp:
+        content = await file.read()
+        tmp.write(content)
         tmp_path = tmp.name
-    waveform, sample_rate = torchaudio.load(tmp_path)
-    if waveform.shape[0] > 1:
-        waveform = waveform.mean(dim=0, keepdim=True)
-    if sample_rate != 16000:
-        resampler = torchaudio.transforms.Resample(sample_rate, 16000)
-        waveform = resampler(waveform)
-    return waveform.to(device), 16000, tmp_path
+
+    print(f"📄 Saved uploaded file to temporary path: {tmp_path} ({len(content)} bytes)")
+
+    try:
+        # Tải file âm thanh bằng torchaudio
+        waveform, sample_rate = torchaudio.load(tmp_path)
+        print(f"🎧 Loaded audio. Original sample rate: {sample_rate}, Shape: {waveform.shape}")
+
+        # Chuẩn hóa audio: mono, 16kHz
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        if sample_rate != 16000:
+            resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)
+            waveform = resampler(waveform)
+            print(f"🔄 Resampled audio to 16000 Hz. New shape: {waveform.shape}")
+
+        return waveform.to(device), 16000, tmp_path
+    except Exception as e:
+        # Xóa tệp tạm nếu có lỗi xảy ra
+        os.remove(tmp_path)
+        print(f"❌ Error processing audio file: {e}")
+        raise e
 
 # ------------------------------------
-#  API ENDPOINTS
+#  API ENDPOINTS (ĐÃ CẬP NHẬT)
 # ------------------------------------
 
 @app.post("/transcribe")
 async def transcribe(file: UploadFile = File(...)):
+    if not asr_model:
+        raise HTTPException(status_code=503, detail="ASR model is not available.")
+    tmp_path = None
     try:
         waveform, sample_rate, tmp_path = await process_audio_file(file)
+        
+        print("🧠 Performing transcription...")
         input_features = asr_processor(waveform.squeeze(0), sampling_rate=sample_rate, return_tensors="pt").input_features.to(device)
         with torch.no_grad():
             generated_ids = asr_model.generate(input_features, max_length=448)
         transcription = asr_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        os.remove(tmp_path)
+        
+        print(f"🎤 Transcription result: '{transcription.strip()}'")
         return {"transcription": transcription.strip()}
     except Exception as e:
-        return {"error": str(e)}
+        print(f"🔥 Error in /transcribe endpoint: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 @app.post("/practice")
 async def practice(file: UploadFile = File(...), target: str = Form(...)):
+    if not asr_model:
+        raise HTTPException(status_code=503, detail="ASR model is not available.")
+    tmp_path = None
     try:
         waveform, sample_rate, tmp_path = await process_audio_file(file)
-        input_features = asr_processor(waveform.squeeze(0), sampling_rate=sample_rate, return_tensors="pt").input_features.to(device)
-        with torch.no_grad():
-            generated_ids = asr_model.generate(input_features, max_length=448)
-        transcription = asr_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        os.remove(tmp_path)
-        result = score_transcription(transcription, target)
-        return result
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.post("/analyze-pronunciation", response_model=AnalysisResult)
-async def analyze_pronunciation(file: UploadFile = File(...), target: str = Form(...)):
-    try:
-        waveform, sample_rate, tmp_path = await process_audio_file(file)
+        
+        print(f"🧠 Performing practice scoring. Target: '{target}'")
         input_features = asr_processor(waveform.squeeze(0), sampling_rate=sample_rate, return_tensors="pt").input_features.to(device)
         with torch.no_grad():
             generated_ids = asr_model.generate(input_features, max_length=448)
         transcription = asr_processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
-        os.remove(tmp_path)
-
-        target_words = re.findall(r"[\w']+|[.,!?;]", target.lower())
-        transcribed_words_set = set(re.findall(r"[\w']+|[.,!?;]", transcription.lower()))
-        word_results: List[WordResult] = []
-        correct_words_count = 0
-
-        for t_word in target_words:
-            is_word_correct = t_word in transcribed_words_set
-            phoneme_details = []
-            num_phonemes = max(2, len(t_word) // 2)
-            for _ in range(num_phonemes):
-                is_phoneme_correct = is_word_correct or random.random() > 0.3
-                phoneme_details.append(PhonemeResult(phoneme="/-/", is_correct=is_phoneme_correct))
-            if is_word_correct:
-                correct_words_count += 1
-            else:
-                if all(p.is_correct for p in phoneme_details) and phoneme_details:
-                    phoneme_details[0].is_correct = False
-            word_results.append(WordResult(word=t_word, is_correct=is_word_correct, phonemes=phoneme_details))
-
-        overall_score = int((correct_words_count / len(target_words)) * 100) if target_words else 0
-        return AnalysisResult(overall_score=overall_score, transcription=transcription, words=word_results)
+        
+        print(f"🎤 Transcription for practice: '{transcription}'")
+        result = score_transcription(transcription, target)
+        print(f"📊 Scoring result: {result}")
+        return result
     except Exception as e:
-        return AnalysisResult(overall_score=0, transcription=f"Error: {str(e)}", words=[])
+        print(f"🔥 Error in /practice endpoint: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+            
 
 @app.post("/chat")
 async def chat(chat_message: ChatMessage):
@@ -251,6 +231,7 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
 
