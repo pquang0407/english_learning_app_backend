@@ -59,13 +59,13 @@ except Exception as e:
     logger.error(f"Critical error loading ASR model: {e}")
     asr_model = None
 
-# Giữ nguyên Gemini 1.5 Flash để tránh lỗi (stable và nhanh)
-GEMINI_MODEL = "gemini-1.5-flash"
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyDBB1dDLi0F5rJI2QSjY8AANd5j2mP_vfQ")
-if GEMINI_API_KEY == "AIzaSyDBB1dDLi0F5rJI2QSjY8AANd5j2mP_vfQ":
-    logger.warning("Using placeholder Gemini API Key. Set GEMINI_API_KEY in environment.")
+# !!! QUAN TRỌNG: SỬA LỖI Ở ĐÂY !!!
+# LƯU Ý: Rất khuyến khích sử dụng biến môi trường thay vì hardcode key
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyCjT592M8WRJDr6yFs3oTgog-m-cDtZFRc")
+if GEMINI_API_KEY == "AIzaSyCjT592M8WRJDr6yFs3oTgog-m-cDtZFRc":
+    print("⚠️ WARNING: Using a hardcoded placeholder Gemini API Key.")
 
-GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
 
 # ------------------
 #  PYDANTIC MODELS
