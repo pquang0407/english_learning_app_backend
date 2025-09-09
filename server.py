@@ -57,7 +57,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyCjT592M8WRJDr6yFs3oTgog-m-cD
 if GEMINI_API_KEY == "AIzaSyCjT592M8WRJDr6yFs3oTgog-m-cDtZFRc":
     print("⚠️ WARNING: Using a hardcoded placeholder Gemini API Key.")
 
-GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+GEMINI_API_URL_STREAM = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:streamGenerateContent?key={GEMINI_API_KEY}"
 
 # ------------------
 #  PYDANTIC MODELS
@@ -134,9 +134,11 @@ async def transcribe(file: UploadFile = File(...)):
 async def chat(chat_message: ChatMessage):
     try:
         prompt_parts = []
-        # Chuyển system prompt vào nội dung chat
-        if chat_message.system_prompt_override:
-            prompt_parts.append({"role": "model", "parts": [{"text": chat_message.system_prompt_override}]})
+        
+        # Thêm system prompt vào đầu lịch sử hội thoại nếu có
+        system_instruction_text = chat_message.system_prompt_override or "Your name is Lilly. You are a friendly English tutor..."
+        prompt_parts.append({"role": "user", "parts": [{"text": system_instruction_text}]})
+        prompt_parts.append({"role": "model", "parts": [{"text": "Hello! How can I help you today?"}]})
         
         # Thêm lịch sử cuộc trò chuyện
         for msg in chat_message.history:
@@ -149,20 +151,17 @@ async def chat(chat_message: ChatMessage):
         
         payload = {
             "contents": prompt_parts,
-            # Bỏ "stream": True vì nó không tương thích với systemInstruction
+            "generationConfig": {"temperature": 0.9}, # Cần đặt thêm các thông số để tối ưu
         }
         
-        async with aiohttp.ClientSession() as session:
-            async with session.post(GEMINI_API_URL, json=payload) as response:
-                response.raise_for_status()
-                
-                result = await response.json()
-                if result and result.get('candidates'):
-                    generated_text = result['candidates'][0].get('content', {}).get('parts', [{}])[0].get('text')
-                    if generated_text:
-                        return {"response": generated_text.strip()}
-                    
-        raise HTTPException(status_code=500, detail="Gemini API returned an invalid or empty response.")
+        async def response_generator():
+            async with aiohttp.ClientSession() as session:
+                async with session.post(GEMINI_API_URL_STREAM, json=payload) as response:
+                    response.raise_for_status()
+                    async for chunk in response.content.iter_any():
+                        yield chunk
+        
+        return StreamingResponse(response_generator(), media_type="text/event-stream")
 
     except aiohttp.ClientResponseError as e:
         print(f"🔥 Gemini API Error: Status {e.status}, Message: {e.message}")
@@ -170,6 +169,7 @@ async def chat(chat_message: ChatMessage):
     except Exception as e:
         print(f"🔥 Error in /chat endpoint: {e}")
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+
 
 @app.get("/tongue-twisters")
 async def get_tongue_twisters():
@@ -217,6 +217,7 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
 
 
 
