@@ -134,41 +134,38 @@ async def transcribe(file: UploadFile = File(...)):
 async def chat(chat_message: ChatMessage):
     try:
         prompt_parts = []
-        
-        # Thêm system prompt vào đầu lịch sử hội thoại nếu có
-        system_instruction_text = chat_message.system_prompt_override or "Your name is Lilly. You are a friendly English tutor..."
-        prompt_parts.append({"role": "user", "parts": [{"text": system_instruction_text}]})
-        prompt_parts.append({"role": "model", "parts": [{"text": "Hello! How can I help you today?"}]})
-        
-        # Thêm lịch sử cuộc trò chuyện
         for msg in chat_message.history:
             if msg.get('user_message') and msg.get('chatbot_response'):
                 prompt_parts.append({"role": "user", "parts": [{"text": msg['user_message']}]})
                 prompt_parts.append({"role": "model", "parts": [{"text": msg['chatbot_response']}]})
         
-        # Thêm tin nhắn hiện tại
         prompt_parts.append({"role": "user", "parts": [{"text": chat_message.message}]})
+        
+        system_instruction = chat_message.system_prompt_override or "Your name is Lilly. You are a friendly English tutor..."
         
         payload = {
             "contents": prompt_parts,
-            "generationConfig": {"temperature": 0.9}, # Cần đặt thêm các thông số để tối ưu
+            "systemInstruction": {"parts": [{"text": system_instruction}]}
         }
         
-        async def response_generator():
-            async with aiohttp.ClientSession() as session:
-                async with session.post(GEMINI_API_URL_STREAM, json=payload) as response:
-                    response.raise_for_status()
-                    async for chunk in response.content.iter_any():
-                        yield chunk
-        
-        return StreamingResponse(response_generator(), media_type="text/event-stream")
+        async with aiohttp.ClientSession() as session:
+            async with session.post(GEMINI_API_URL, json=payload) as response:
+                response.raise_for_status()
+                
+                result = await response.json()
+                if result and result.get('candidates'):
+                    generated_text = result['candidates'][0].get('content', {}).get('parts', [{}])[0].get('text')
+                    if generated_text:
+                        return {"response": generated_text.strip()}
+                    
+        raise HTTPException(status_code=500, detail="Gemini API returned an invalid or empty response.")
 
     except aiohttp.ClientResponseError as e:
         print(f"🔥 Gemini API Error: Status {e.status}, Message: {e.message}")
         raise HTTPException(status_code=502, detail=f"Failed to communicate with the AI service. Reason: {e.message}")
     except Exception as e:
         print(f"🔥 Error in /chat endpoint: {e}")
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/tongue-twisters")
@@ -217,6 +214,7 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
 
 
 
