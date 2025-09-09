@@ -1,3 +1,6 @@
+# ------------------
+#  IMPORTS
+# ------------------
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -14,11 +17,11 @@ import time
 import logging
 import mimetypes
 
-# Configure logging
+# Cấu hình logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Assume scoring.py exists for transcription scoring
+# Giả định bạn có file scoring.py
 try:
     from utils.scoring import score_transcription
 except ImportError:
@@ -26,11 +29,11 @@ except ImportError:
         logger.warning("score_transcription not found. Using dummy scoring.")
         from difflib import SequenceMatcher
         score = SequenceMatcher(None, transcription.lower(), target.lower()).ratio() * 100
-        matches = [{"word": w, "status": "correct" if w.lower() in transcription.lower().split() else "missing"} for w in target.lower().split()]
+        matches = [{"word": w, "status": "correct" if w in transcription.lower().split() else "missing"} for w in target.lower().split()]
         return {"score": int(score), "matches": matches, "transcription": transcription, "target": target}
 
 # ------------------
-# APP INITIALIZATION
+#  APP INITIALIZATION
 # ------------------
 app = FastAPI()
 
@@ -43,7 +46,7 @@ app.add_middleware(
 )
 
 # ------------------
-# MODEL LOADING & CONFIG
+#  MODEL LOADING & CONFIG
 # ------------------
 device = "cpu"
 logger.info(f"Using device: {device}")
@@ -56,6 +59,8 @@ except Exception as e:
     logger.error(f"Critical error loading ASR model: {e}")
     asr_model = None
 
+# !!! QUAN TRỌNG: SỬA LỖI Ở ĐÂY !!!
+# LƯU Ý: Rất khuyến khích sử dụng biến môi trường thay vì hardcode key
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyCjT592M8WRJDr6yFs3oTgog-m-cDtZFRc")
 if GEMINI_API_KEY == "AIzaSyCjT592M8WRJDr6yFs3oTgog-m-cDtZFRc":
     print("⚠️ WARNING: Using a hardcoded placeholder Gemini API Key.")
@@ -63,44 +68,49 @@ if GEMINI_API_KEY == "AIzaSyCjT592M8WRJDr6yFs3oTgog-m-cDtZFRc":
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
 
 # ------------------
-# PYDANTIC MODELS
+#  PYDANTIC MODELS
 # ------------------
 class ChatMessage(BaseModel):
     message: str
     history: list[dict] = []
     system_prompt_override: Optional[str] = None
-    stream: bool = False
+    stream: bool = False  # Thêm flag cho streaming
 
 # ------------------
-# HELPER FUNCTIONS
+#  HELPER FUNCTIONS
 # ------------------
 async def process_audio_file(file: UploadFile):
     """Processes an audio file, converts it to 16kHz WAV, and saves it to a temp file."""
     start_time = time.time()
+    
+    # Use the MIME type from the UploadFile object which is more reliable.
+    client_mime_type = file.content_type
+    
     content = await file.read()
-    if len(content) == 0:
+    if not content:
         logger.error("Empty audio file uploaded")
         raise HTTPException(status_code=400, detail="Empty audio file uploaded")
 
-    # Correctly identify and handle audio formats including audio/x-wav
-    allowed_mime_types = ["audio/wav", "audio/wave", "audio/x-wav", "audio/webm"]
-    mime_type, _ = mimetypes.guess_type(file.filename or "")
-    
-    if not mime_type or mime_type not in allowed_mime_types:
-        logger.error(f"Invalid audio format: {mime_type}. Allowed: {allowed_mime_types}")
+    allowed_mime_types = ["audio/wav", "audio/wave", "audio/x-wav", "audio/webm", "audio/ogg"]
+    if not client_mime_type or client_mime_type not in allowed_mime_types:
+        logger.error(f"Invalid audio format: {client_mime_type}. Allowed: {allowed_mime_types}")
         raise HTTPException(status_code=400, detail="Invalid audio format. Only WAV or WebM supported.")
 
-    # Save the original file to a temporary location
+    # Determine the input format for pydub based on the client's MIME type
+    input_format = "webm" if "webm" in client_mime_type else "wav"
+
     tmp_path = None
     tmp_wav_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg" if mime_type == "audio/webm" else ".wav") as tmp:
+        # Save the original file to a temporary location with the correct suffix
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{input_format}") as tmp:
             tmp.write(content)
             tmp_path = tmp.name
 
         # Load and convert audio using pydub
-        logger.info(f"Loading audio from {tmp_path} (MIME: {mime_type})")
-        audio_segment = AudioSegment.from_file(tmp_path, format="webm" if "webm" in mime_type else "wav")
+        logger.info(f"Loading audio from {tmp_path} (MIME: {client_mime_type})")
+        audio_segment = AudioSegment.from_file(tmp_path, format=input_format)
+        
         logger.info("Converting audio to 16kHz mono...")
         audio_segment = audio_segment.set_frame_rate(16000).set_channels(1).set_sample_width(2)
         
@@ -110,22 +120,22 @@ async def process_audio_file(file: UploadFile):
         logger.info(f"Audio converted to WAV at {tmp_wav_path} in {time.time() - start_time:.2f}s")
         
         return tmp_wav_path
+    
     except Exception as e:
         logger.error(f"Error processing audio: {e}")
-        # Ensure temporary files are cleaned up in case of error
+        # Clean up temporary files in case of error
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
         if tmp_wav_path and os.path.exists(tmp_wav_path):
             os.unlink(tmp_wav_path)
         raise HTTPException(status_code=500, detail=f"Failed to process audio: {str(e)}")
 
-
 @lru_cache(maxsize=1)
 async def cached_generate_topics():
     start_time = time.time()
     payload = {
         "contents": [{"parts": [{"text": "Generate 5 English pronunciation topics for learners, from easy to hard. Each topic should have a title and 5 example sentences. Return a JSON array of objects with 'id', 'title', and 'sentences' keys."}]}],
-        "generationConfig": {"responseMimeType": "application/json", "maxOutputTokens": 500}
+        "generationConfig": {"responseMimeType": "application/json", "maxOutputTokens": 500}  # Giới hạn output để nhanh hơn
     }
     
     async with aiohttp.ClientSession() as session:
@@ -145,7 +155,7 @@ async def cached_generate_topics():
     raise HTTPException(status_code=500, detail="Gemini API returned invalid format.")
 
 async def stream_gemini_response(payload: dict) -> AsyncGenerator[str, None]:
-    """Stream response from Gemini API."""
+    """Stream phản hồi từ Gemini API"""
     start_time = time.time()
     async with aiohttp.ClientSession() as session:
         async with session.post(GEMINI_API_URL, json=payload, timeout=10) as response:
@@ -156,11 +166,11 @@ async def stream_gemini_response(payload: dict) -> AsyncGenerator[str, None]:
                 return
             async for chunk in response.content.iter_chunked(1024):
                 if chunk:
-                    yield chunk.decode('utf-8')
+                    yield chunk.decode('utf-8')  # Stream từng chunk
     logger.info(f"Streamed response took {time.time() - start_time:.2f} seconds")
 
 # ------------------
-# API ENDPOINTS
+#  API ENDPOINTS
 # ------------------
 @app.post("/practice")
 async def practice(file: UploadFile = File(...), target: str = Form(...)):
@@ -171,11 +181,12 @@ async def practice(file: UploadFile = File(...), target: str = Form(...)):
     start_time = time.time()
     tmp_path = None
     try:
-        # Process audio file
+        # Xử lý file audio
         logger.info("Processing audio file...")
         tmp_path = await process_audio_file(file)
+        logger.info(f"Audio file processed: {tmp_path}")
         
-        # Transcribe with faster-whisper
+        # Transcribe với faster-whisper
         logger.info("Starting transcription...")
         segments, info = asr_model.transcribe(tmp_path, beam_size=5, language="en")
         transcription = " ".join([segment.text for segment in segments]).strip()
@@ -192,6 +203,7 @@ async def practice(file: UploadFile = File(...), target: str = Form(...)):
             return result
         except Exception as e:
             logger.error(f"Error in score_transcription: {e}")
+            # Fallback dummy result
             dummy_result = {
                 "score": 0,
                 "matches": [{"word": w, "status": "missing"} for w in target.lower().split()],
@@ -205,7 +217,7 @@ async def practice(file: UploadFile = File(...), target: str = Form(...)):
         logger.error(f"Error in /practice endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Practice failed: {str(e)}")
     finally:
-        # Cleanup temporary file
+        # Cleanup file tạm
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.unlink(tmp_path)
@@ -222,6 +234,7 @@ async def transcribe(file: UploadFile = File(...)):
     tmp_path = None
     try:
         tmp_path = await process_audio_file(file)
+        logger.info(f"Audio file processed: {tmp_path}")
         
         segments, info = asr_model.transcribe(tmp_path, beam_size=5, language="en")
         transcription = " ".join([segment.text for segment in segments]).strip()
@@ -243,6 +256,7 @@ async def transcribe(file: UploadFile = File(...)):
 async def chat(chat_message: ChatMessage):
     start_time = time.time()
     try:
+        # Tối ưu: Giới hạn history để giảm payload (chỉ 3 tin nhắn gần nhất)
         history = chat_message.history[-3:] if chat_message.history else []
         prompt_parts = []
         for msg in history:
@@ -256,20 +270,22 @@ async def chat(chat_message: ChatMessage):
             "contents": prompt_parts,
             "systemInstruction": {"parts": [{"text": system_instruction}]},
             "generationConfig": {
-                "maxOutputTokens": 200,
-                "temperature": 0.7,
+                "maxOutputTokens": 200,  # Giới hạn output để nhanh hơn
+                "temperature": 0.7,  # Giảm randomness để xử lý nhanh
                 "topP": 0.8
             }
         }
         
         if chat_message.stream:
+            # Streaming mode
             async def generate():
                 async for chunk in stream_gemini_response(payload):
-                    yield f"data: {json.dumps({'delta': chunk})}\n\n"
+                    yield f"data: {json.dumps({'delta': chunk})}\n\n"  # SSE format cho stream
                 yield "data: [DONE]\n\n"
             
             return StreamingResponse(generate(), media_type="text/event-stream")
         else:
+            # Non-streaming (giữ nguyên cho compatibility)
             async with aiohttp.ClientSession() as session:
                 async with session.post(GEMINI_API_URL, json=payload, timeout=10) as response:
                     response.raise_for_status()
@@ -307,6 +323,9 @@ async def get_topics():
 async def generate_topics():
     return {"topics": await cached_generate_topics()}
 
+# ------------------
+#  RUN THE APP
+# ------------------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
